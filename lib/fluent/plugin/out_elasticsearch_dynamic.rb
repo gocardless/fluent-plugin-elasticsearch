@@ -204,16 +204,17 @@ module Fluent::Plugin
       end
 
       bulk_message.each do |info, msgs|
-        send_bulk(msgs, info.host, info.index) unless msgs.empty?
+        send_bulk(msgs, tag, chunk, info.host, info.index) unless msgs.empty?
         msgs.clear
       end
     end
 
-    def send_bulk(data, host, index)
+    def send_bulk(data, tag, chunk, host, index)
       begin
         response = client(host).bulk body: data, index: index
         if response['errors']
           log.error "Could not push log to Elasticsearch: #{response}"
+          handle_error(response, tag, chunk)
         end
       rescue => e
         @_es = nil if @reconnect_on_error
@@ -273,6 +274,55 @@ module Fluent::Plugin
       end
 
       return true
+    end
+
+    def handle_error(response, tag, chunk)
+      items = response['items']
+      if items.nil? || !items.is_a?(Array)
+        raise ElasticsearchVersionMismatch, "The response format was unrecognized: #{response}"
+      end
+      stats = Hash.new(0)
+      chunk.msgpack_each do |time, rawrecord|
+        bulk_message = ''
+        next unless rawrecord.is_a? Hash
+
+        item = items.shift
+        write_op = nil
+        if item.has_key?(write_operation)
+          write_op = write_operation
+        elsif INDEX_OP == write_operation && item.has_key?(CREATE_OP)
+          write_op = CREATE_OP
+        else
+          # When we don't have an expected ops field, something changed in the API
+          # expected return values (ES 2.x)
+          stats[:errors_bad_resp] += 1
+          next
+        end
+        if item[write_op].has_key?('status')
+          status = item[write_op]['status']
+        else
+          # When we don't have a status field, something changed in the API
+          # expected return values (ES 2.x)
+          stats[:errors_bad_resp] += 1
+          next
+        end
+        case
+        when [200, 201].include?(status)
+          stats[:successes] += 1
+        when CREATE_OP == write_op && 409 == status
+          stats[:duplicates] += 1
+        when 400 == status
+          stats[:bad_argument] += 1
+          reason = ""
+          if item[write_op].has_key?('error') && item[write_op]['error'].has_key?('type')
+            reason = " [error type]: #{item[write_op]['error']['type']}"
+          end
+          if item[write_op].has_key?('error') && item[write_op]['error'].has_key?('reason')
+            reason += " [reason]: \'#{item[write_op]['error']['reason']}\'"
+          end
+          router.emit_error_event(tag, time, rawrecord, ElasticsearchErrorHandler::ElasticsearchError.new("400 - Rejected by Elasticsearch#{reason}"))
+        end
+      end
     end
   end
 end
